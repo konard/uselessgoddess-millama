@@ -71,6 +71,8 @@ pub struct Update {
   pub update_id: i64,
   #[serde(default)]
   pub callback_query: Option<CallbackQuery>,
+  #[serde(default)]
+  pub message: Option<BotMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +94,16 @@ pub struct User {
 pub struct CallbackMessage {
   pub message_id: i64,
   pub chat: Chat,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BotMessage {
+  #[allow(dead_code)]
+  pub message_id: i64,
+  pub chat: Chat,
+  #[serde(default)]
+  pub text: Option<String>,
+  pub from: User,
 }
 
 #[derive(Debug, Serialize)]
