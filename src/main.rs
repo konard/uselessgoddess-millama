@@ -148,7 +148,6 @@ async fn run_client(config: Config) -> Result<()> {
     lock.bot_self_id = self_id_bare;
   }
 
-  let self_id = PeerId::self_user();
   info!("Running as self user (ID: {})", self_id_bare);
 
   let mut update_stream =
@@ -194,9 +193,7 @@ async fn run_client(config: Config) -> Result<()> {
             let state = state.clone();
 
             tasks.spawn(async move {
-              if let Err(e) =
-                handle_update(client, update, state, self_id).await
-              {
+              if let Err(e) = handle_update(client, update, state).await {
                 error!("Error handling update: {}", e);
               }
             });
@@ -214,7 +211,6 @@ async fn handle_update(
   client: Client,
   update: Update,
   state: Arc<Mutex<BotState>>,
-  _self_id: PeerId,
 ) -> Result<()> {
   if let Update::NewMessage(message) = update {
     let peer = match message.peer() {
@@ -223,11 +219,7 @@ async fn handle_update(
     };
 
     // Escape control characters for logging to prevent log injection
-    let message_text = message
-      .text()
-      .chars()
-      .map(|c| if c.is_control() && c != '\n' && c != '\t' { '�' } else { c })
-      .collect::<String>();
+    let message_text = message.text().escape_debug().to_string();
     trace!("Message from user ({}): {}", peer.id, message_text);
 
     // Handle messages from tracked users
@@ -309,7 +301,7 @@ async fn process_ai_draft(
     (
       lock.config.ai.api_key.clone(),
       lock.config.ai.api_url.clone(),
-      lock.config.ai.models_priority(),
+      lock.config.ai.models.clone(),
       lock.config.ai.temperature,
       lock.config.settings.history_limit,
       lock.bot_client.clone(),
@@ -371,8 +363,8 @@ async fn process_ai_draft(
   // Send draft via Bot API with inline buttons
   let target_id = peer.id.bare_id();
   let draft_message = format!(
-    "*AI Draft Suggestion for [{}](tg://user?id={})*\n\n{}\n\n",
-    user.name, target_id, response_text
+    "*AI Draft Suggestion for @{}*\n\n{}\n\n",
+    user.name, response_text
   );
 
   let callback_data = format!("approve:{}", target_id);

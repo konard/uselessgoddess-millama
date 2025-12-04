@@ -32,25 +32,9 @@ pub struct TelegramConfig {
 pub struct AiConfig {
   pub api_key: String,
   pub api_url: String,
-  #[serde(default)]
-  pub model: String,
-  #[serde(default)]
   pub models: Vec<String>,
   #[serde(default = "default_temperature")]
   pub temperature: f32,
-}
-
-impl AiConfig {
-  /// Returns a list of models to try in priority order
-  pub fn models_priority(&self) -> Vec<String> {
-    if !self.models.is_empty() {
-      self.models.clone()
-    } else if !self.model.is_empty() {
-      vec![self.model.clone()]
-    } else {
-      vec![]
-    }
-  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +55,7 @@ pub struct TrackedUser {
 }
 
 impl TrackedUser {
+  #[allow(dead_code)]
   pub fn user_id(&self) -> PeerId {
     PeerId::user(self.id)
   }
@@ -115,12 +100,7 @@ impl Config {
   }
 
   pub fn users_map(&self) -> HashMap<PeerId, TrackedUser> {
-    // Map both user and chat IDs to handle different peer types
-    let mut map = HashMap::new();
-    for user in &self.users {
-      map.insert(user.user_id(), user.clone());
-      map.insert(user.chat_id(), user.clone());
-    }
-    map
+    // Map chat IDs for matching incoming messages
+    self.users.iter().map(|user| (user.chat_id(), user.clone())).collect()
   }
 }
