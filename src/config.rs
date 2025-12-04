@@ -55,11 +55,6 @@ pub struct TrackedUser {
 }
 
 impl TrackedUser {
-  #[allow(dead_code)]
-  pub fn user_id(&self) -> PeerId {
-    PeerId::user(self.id)
-  }
-
   pub fn chat_id(&self) -> PeerId {
     PeerId::chat(self.id)
   }

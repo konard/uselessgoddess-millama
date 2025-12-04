@@ -32,26 +32,6 @@ struct MessageContent {
   content: String,
 }
 
-#[allow(dead_code)]
-pub async fn generate_reply(
-  api_key: &str,
-  api_url: &str,
-  model: &str,
-  temperature: f32,
-  system_prompt: &str,
-  history: Vec<ChatMessage>,
-) -> Result<String> {
-  generate_reply_with_model(
-    api_key,
-    api_url,
-    model,
-    temperature,
-    system_prompt,
-    history,
-  )
-  .await
-}
-
 pub async fn generate_reply_with_fallback(
   api_key: &str,
   api_url: &str,
