@@ -11,15 +11,12 @@ use std::{
 
 use {
   clap::Parser,
-  grammers_client::{
-    Client, InputMessage, SignInError, Update, UpdatesConfiguration,
-  },
+  grammers_client::{Client, SignInError, Update, UpdatesConfiguration},
   grammers_mtsender::SenderPool,
   grammers_session::{
     defs::{PeerId, PeerRef},
     storages::SqliteSession,
   },
-  grammers_tl_types::{enums::MessageEntity, types::MessageEntityBold},
 };
 
 use {
@@ -34,8 +31,10 @@ struct BotState {
   pending_tasks: HashMap<PeerId, tokio::task::AbortHandle>,
   users: HashMap<PeerId, TrackedUser>,
   config: Config,
-  bot_client: Option<Arc<bot::BotClient>>,
-  bot_self_id: Option<i64>,
+  bot_client: Arc<bot::BotClient>,
+  bot_self_id: i64,
+  // Maps callback_id to (target_id, message_text)
+  draft_messages: HashMap<String, (i64, String)>,
 }
 
 #[derive(Parser, Debug)]
@@ -92,17 +91,17 @@ async fn main() -> Result<()> {
 async fn run_client(config: Config) -> Result<()> {
   let users_map = config.users_map();
 
-  let bot_client = config.telegram.bot_token.as_ref().map(|token| {
-    info!("Bot token configured, will use Bot API for approval workflow");
-    Arc::new(bot::BotClient::new(token.clone()))
-  });
+  let bot_client =
+    Arc::new(bot::BotClient::new(config.telegram.bot_token.clone()));
+  info!("Bot token configured, using Bot API for approval workflow");
 
   let state = Arc::new(Mutex::new(BotState {
     pending_tasks: HashMap::new(),
     users: users_map,
     config: config.clone(),
     bot_client,
-    bot_self_id: None,
+    bot_self_id: 0, // Will be set after login
+    draft_messages: HashMap::new(),
   }));
 
   info!("Connecting to Telegram...");
@@ -146,7 +145,7 @@ async fn run_client(config: Config) -> Result<()> {
   // Store self ID for bot messages
   {
     let mut lock = state.lock().unwrap();
-    lock.bot_self_id = Some(self_id_bare);
+    lock.bot_self_id = self_id_bare;
   }
 
   let self_id = PeerId::self_user();
@@ -156,24 +155,23 @@ async fn run_client(config: Config) -> Result<()> {
     client.stream_updates(updates, UpdatesConfiguration::default());
   let mut tasks = JoinSet::new();
 
-  // Start bot updates polling task if bot_client is configured
+  // Start bot updates polling task
   let bot_client_for_polling = {
     let lock = state.lock().unwrap();
     lock.bot_client.clone()
   };
 
-  if let Some(bot_client) = bot_client_for_polling {
-    let state_for_bot = state.clone();
-    let client_for_bot = client.clone();
-    tasks.spawn(async move {
-      if let Err(e) =
-        poll_bot_updates(bot_client, client_for_bot, state_for_bot).await
-      {
-        error!("Bot updates polling error: {}", e);
-      }
-    });
-    info!("Started bot updates polling task");
-  }
+  let state_for_bot = state.clone();
+  let client_for_bot = client.clone();
+  tasks.spawn(async move {
+    if let Err(e) =
+      poll_bot_updates(bot_client_for_polling, client_for_bot, state_for_bot)
+        .await
+    {
+      error!("Bot updates polling error: {}", e);
+    }
+  });
+  info!("Started bot updates polling task");
 
   info!("Bot is ready and listening for updates");
 
@@ -377,58 +375,31 @@ async fn process_ai_draft(
 
   info!("Generated AI response for user {}", user.name);
 
-  // Use bot API if configured, otherwise fall back to self-messages
-  if let (Some(bot_client), Some(self_id)) = (bot_client, bot_self_id) {
-    // Use Bot API with inline buttons
-    let draft_message = format!(
-      "*AI Draft Suggestion for {}*\n\n{}\n\n",
-      user.name, response_text
-    );
+  // Send draft via Bot API with inline buttons
+  let draft_message =
+    format!("*AI Draft Suggestion for {}*\n\n{}\n\n", user.name, response_text);
 
-    let callback_data = format!("approve:{}", peer.id.bare_id());
-    let reject_data = format!("reject:{}", peer.id.bare_id());
+  let target_id = peer.id.bare_id();
+  let callback_data = format!("approve:{}", target_id);
+  let reject_data = format!("reject:{}", target_id);
 
-    let buttons = vec![vec![
-      ("✅ Approve".to_string(), callback_data),
-      ("❌ Reject".to_string(), reject_data),
-    ]];
+  let buttons = vec![vec![
+    ("✅ Approve".to_string(), callback_data.clone()),
+    ("❌ Reject".to_string(), reject_data.clone()),
+  ]];
 
-    bot_client
-      .send_message_with_buttons(self_id, draft_message, buttons)
-      .await
-      .context("Failed to send draft via bot")?;
+  bot_client
+    .send_message_with_buttons(bot_self_id, draft_message, buttons)
+    .await
+    .context("Failed to send draft via bot")?;
 
-    debug!("Sent draft message via bot to self");
-  } else {
-    // Fall back to self-messages
-    let draft_message = format!(
-      concat!(
-        "**AI Draft Suggestion for {}**\n\n{}\n\n`{}`\n\n",
-        "Reply with '+', 'yes', or 'approve' to send\n\n",
-        "--- METADATA ---\nTARGET_ID:{}\n"
-      ),
-      user.name,
-      response_text,
-      "-".repeat(20),
-      peer.id.bare_id()
-    );
-
-    // Send draft to self
-    client
-      .send_message(
-        PeerRef { id: PeerId::self_user(), auth: Default::default() },
-        InputMessage::new().text(draft_message).fmt_entities([
-          MessageEntity::Bold(MessageEntityBold {
-            offset: 0,
-            length: (32 + user.name.len()) as i32,
-          }),
-        ]),
-      )
-      .await
-      .context("Failed to send draft message")?;
-
-    debug!("Sent draft message to self");
+  // Store draft message for later retrieval
+  {
+    let mut lock = state.lock().unwrap();
+    lock.draft_messages.insert(callback_data, (target_id, response_text));
   }
+
+  debug!("Sent draft message via bot to self");
 
   Ok(())
 }
@@ -498,7 +469,7 @@ async fn handle_approval(
 async fn poll_bot_updates(
   bot_client: Arc<bot::BotClient>,
   client: Client,
-  _state: Arc<Mutex<BotState>>,
+  state: Arc<Mutex<BotState>>,
 ) -> Result<()> {
   let mut offset: Option<i64> = None;
 
@@ -511,10 +482,11 @@ async fn poll_bot_updates(
       if let Some(callback) = update.callback_query {
         let bot_client = bot_client.clone();
         let client = client.clone();
+        let state = state.clone();
 
         tokio::spawn(async move {
           if let Err(e) =
-            handle_bot_callback(bot_client, client, callback).await
+            handle_bot_callback(bot_client, client, state, callback).await
           {
             error!("Error handling bot callback: {}", e);
           }
@@ -527,6 +499,7 @@ async fn poll_bot_updates(
 async fn handle_bot_callback(
   bot_client: Arc<bot::BotClient>,
   client: Client,
+  state: Arc<Mutex<BotState>>,
   callback: bot::CallbackQuery,
 ) -> Result<()> {
   let data = callback.data.as_ref().context("No callback data")?;
@@ -541,53 +514,22 @@ async fn handle_bot_callback(
     .context("Failed to answer callback query")?;
 
   if data.starts_with("approve:") {
-    let target_id = data
-      .strip_prefix("approve:")
-      .and_then(|s| s.parse::<i64>().ok())
-      .context("Failed to parse target ID from callback")?;
+    // Retrieve draft message from state
+    let (target_id, message_text) = {
+      let mut lock = state.lock().unwrap();
+      lock.draft_messages.remove(data).context("Draft message not found")?
+    };
 
     info!("Approving message to target ID: {}", target_id);
 
-    // Extract the message text from the bot message
-    let message_text = message.text.as_ref().context("No message text")?;
-
-    // Extract just the AI response (skip the header)
-    let lines: Vec<&str> = message_text.lines().collect();
-    let clean_text = lines
-      .iter()
-      .skip_while(|line| {
-        line.trim().is_empty()
-          || line.contains("AI Draft")
-          || line.contains("Suggestion")
-      })
-      .skip(1) // Skip the blank line after header
-      .copied()
-      .collect::<Vec<&str>>()
-      .join("\n");
-
-    let final_text = clean_text.trim();
-
-    if final_text.is_empty() {
-      warn!("Final text is empty, aborting approval");
-      bot_client
-        .edit_message_text(
-          message.chat.id,
-          message.message_id,
-          "❌ *Error:* Empty message, approval cancelled".to_string(),
-        )
-        .await
-        .context("Failed to edit message")?;
-      return Ok(());
-    }
-
-    debug!("Sending approved message: {}", final_text);
+    debug!("Sending approved message: {}", message_text);
 
     let target =
       PeerRef { id: PeerId::chat(target_id), auth: Default::default() };
 
     let target_peer = client.resolve_peer(target).await?;
     client
-      .send_message(target_peer, final_text)
+      .send_message(target_peer, &message_text)
       .await
       .context("Failed to send approved message")?;
 
@@ -596,7 +538,7 @@ async fn handle_bot_callback(
       .edit_message_text(
         message.chat.id,
         message.message_id,
-        format!("✅ *Sent*\n\n{}", final_text),
+        format!("✅ *Sent*\n\n{}", message_text),
       )
       .await
       .context("Failed to edit message")?;
@@ -604,6 +546,13 @@ async fn handle_bot_callback(
     info!("Message sent successfully to {}", target_id);
   } else if data.starts_with("reject:") {
     info!("Rejecting draft");
+
+    // Remove draft message from state
+    {
+      let mut lock = state.lock().unwrap();
+      let reject_key = data.replace("reject:", "approve:");
+      lock.draft_messages.remove(&reject_key);
+    }
 
     // Update the bot message to show it was rejected
     bot_client

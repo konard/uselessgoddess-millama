@@ -92,7 +92,6 @@ pub struct User {
 pub struct CallbackMessage {
   pub message_id: i64,
   pub chat: Chat,
-  pub text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
