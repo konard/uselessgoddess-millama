@@ -3,11 +3,17 @@
 
 [telegram]
 # Your Telegram API credentials
+# Get these from https://my.telegram.org/apps
 api_id = 12345678
 api_hash = "your_api_hash_here"
 
-# Bot token for inline button approval (optional, if not set uses self-messaging)
-# bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+# Bot token for inline button approval (REQUIRED)
+# Get bot token from @BotFather on Telegram:
+#   1. Send /newbot to @BotFather
+#   2. Choose a name and username for your bot
+#   3. Copy the token and paste it here
+# Approval messages will use inline buttons ("Approve ✅" / "Reject ❌")
+bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 
 [ai]
 # OpenAI-compatible API configuration
