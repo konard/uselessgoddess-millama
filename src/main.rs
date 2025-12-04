@@ -35,6 +35,8 @@ struct BotState {
   bot_self_id: i64,
   // Maps callback_id to (target_id, message_text)
   draft_messages: HashMap<String, (i64, String)>,
+  // Maps target_id to (chat_id, message_id, original_history)
+  pending_rephrase: HashMap<i64, (i64, i64, Vec<ChatMessage>)>,
 }
 
 #[derive(Parser, Debug)]
@@ -102,6 +104,7 @@ async fn run_client(config: Config) -> Result<()> {
     bot_client,
     bot_self_id: 0, // Will be set after login
     draft_messages: HashMap::new(),
+    pending_rephrase: HashMap::new(),
   }));
 
   info!("Connecting to Telegram...");
@@ -288,6 +291,16 @@ async fn process_ai_draft(
   user: &TrackedUser,
   state: &Arc<Mutex<BotState>>,
 ) -> Result<()> {
+  process_ai_draft_with_guidance(client, peer, user, state, None).await
+}
+
+async fn process_ai_draft_with_guidance(
+  client: &Client,
+  peer: PeerRef,
+  user: &TrackedUser,
+  state: &Arc<Mutex<BotState>>,
+  rephrase_guidance: Option<String>,
+) -> Result<()> {
   let (
     api_key,
     api_url,
@@ -347,13 +360,20 @@ async fn process_ai_draft(
 
   debug!("Loaded {} messages from history", history_buf.len());
 
+  // Build the system prompt with optional rephrase guidance
+  let system_prompt = if let Some(guidance) = rephrase_guidance.as_ref() {
+    format!("{}\n\nAdditional guidance: {}", user.system_prompt, guidance)
+  } else {
+    user.system_prompt.clone()
+  };
+
   let response_text = llm::generate_reply_with_fallback(
     &api_key,
     &api_url,
     models,
     temperature,
-    &user.system_prompt,
-    history_buf,
+    &system_prompt,
+    history_buf.clone(),
   )
   .await
   .context("Failed to generate AI reply")?;
@@ -368,22 +388,27 @@ async fn process_ai_draft(
   );
 
   let callback_data = format!("approve:{}", target_id);
+  let rephrase_data = format!("rephrase:{}", target_id);
   let reject_data = format!("reject:{}", target_id);
 
   let buttons = vec![vec![
     ("✅ Approve".to_string(), callback_data.clone()),
+    ("🔄 Rephrase".to_string(), rephrase_data.clone()),
     ("❌ Reject".to_string(), reject_data.clone()),
   ]];
 
-  bot_client
+  let message_id = bot_client
     .send_message_with_buttons(bot_self_id, draft_message, buttons)
     .await
     .context("Failed to send draft via bot")?;
 
-  // Store draft message for later retrieval
+  // Store draft message and history for later retrieval
   {
     let mut lock = state.lock().unwrap();
     lock.draft_messages.insert(callback_data, (target_id, response_text));
+    lock
+      .pending_rephrase
+      .insert(target_id, (bot_self_id, message_id, history_buf));
   }
 
   debug!("Sent draft message via bot to self");
@@ -414,6 +439,18 @@ async fn poll_bot_updates(
             handle_bot_callback(bot_client, client, state, callback).await
           {
             error!("Error handling bot callback: {}", e);
+          }
+        });
+      } else if let Some(message) = update.message {
+        let bot_client = bot_client.clone();
+        let client = client.clone();
+        let state = state.clone();
+
+        tokio::spawn(async move {
+          if let Err(e) =
+            handle_bot_message(bot_client, client, state, message).await
+          {
+            error!("Error handling bot message: {}", e);
           }
         });
       }
@@ -464,15 +501,53 @@ async fn handle_bot_callback(
       .await
       .context("Failed to edit message")?;
 
-    info!("Message sent successfully to {}", target_id);
-  } else if data.starts_with("reject:") {
-    info!("Rejecting draft");
-
-    // Remove draft message from state
+    // Clean up rephrase state
     {
       let mut lock = state.lock().unwrap();
-      let reject_key = data.replace("reject:", "approve:");
+      lock.pending_rephrase.remove(&target_id);
+    }
+
+    info!("Message sent successfully to {}", target_id);
+  } else if data.starts_with("rephrase:") {
+    let target_id: i64 = data
+      .strip_prefix("rephrase:")
+      .context("Invalid rephrase data")?
+      .parse()
+      .context("Failed to parse target_id")?;
+
+    info!("Rephrase requested for target ID: {}", target_id);
+
+    // Update the bot message to prompt for rephrase guidance
+    let rephrase_prompt = concat!(
+      "🔄 *Rephrase Mode*\n\n",
+      "Please send me the guidance for rephrasing ",
+      "(e.g., \"the name of user is John\")"
+    );
+    bot_client
+      .edit_message_text(
+        message.chat.id,
+        message.message_id,
+        rephrase_prompt.to_string(),
+      )
+      .await
+      .context("Failed to edit message")?;
+
+    debug!("Waiting for rephrase guidance for target {}", target_id);
+  } else if data.starts_with("reject:") {
+    let target_id: i64 = data
+      .strip_prefix("reject:")
+      .context("Invalid reject data")?
+      .parse()
+      .context("Failed to parse target_id")?;
+
+    info!("Rejecting draft for target ID: {}", target_id);
+
+    // Remove draft message and rephrase state
+    {
+      let mut lock = state.lock().unwrap();
+      let reject_key = format!("approve:{}", target_id);
       lock.draft_messages.remove(&reject_key);
+      lock.pending_rephrase.remove(&target_id);
     }
 
     // Update the bot message to show it was rejected
@@ -485,6 +560,169 @@ async fn handle_bot_callback(
       .await
       .context("Failed to edit message")?;
   }
+
+  Ok(())
+}
+
+async fn handle_bot_message(
+  bot_client: Arc<bot::BotClient>,
+  client: Client,
+  state: Arc<Mutex<BotState>>,
+  message: bot::BotMessage,
+) -> Result<()> {
+  let text = match message.text.as_ref() {
+    Some(t) if !t.is_empty() => t,
+    _ => return Ok(()), // Ignore messages without text
+  };
+
+  let bot_self_id = {
+    let lock = state.lock().unwrap();
+    lock.bot_self_id
+  };
+
+  // Only process messages from self
+  if message.from.id != bot_self_id {
+    return Ok(());
+  }
+
+  debug!("Received bot message from self: {}", text);
+
+  // Check if any rephrase request is pending
+  let pending_rephrase_targets: Vec<i64> = {
+    let lock = state.lock().unwrap();
+    lock.pending_rephrase.keys().copied().collect()
+  };
+
+  if pending_rephrase_targets.is_empty() {
+    debug!("No pending rephrase requests, ignoring message");
+    return Ok(());
+  }
+
+  // Process rephrase for all pending targets (should typically be just one)
+  for target_id in pending_rephrase_targets {
+    info!("Processing rephrase guidance for target {}: {}", target_id, text);
+
+    // Retrieve rephrase state and user info
+    let (user, history) = {
+      let mut lock = state.lock().unwrap();
+      let (_, _, history) = lock
+        .pending_rephrase
+        .remove(&target_id)
+        .context("No pending rephrase")?;
+
+      let user =
+        lock.users.get(&PeerId::chat(target_id)).cloned().context(format!(
+          "User not found for target_id {}. Available users: {:?}",
+          target_id,
+          lock.users.keys().collect::<Vec<_>>()
+        ))?;
+
+      (user, history)
+    };
+
+    debug!("Found user {} for rephrase, regenerating with guidance", user.name);
+
+    // Regenerate AI response with guidance
+    let peer =
+      PeerRef { id: PeerId::user(target_id), auth: Default::default() };
+
+    // We need to pass the history and guidance to regenerate
+    // Let's call a modified version that accepts history directly
+    if let Err(e) = regenerate_with_guidance(
+      &client,
+      peer,
+      &user,
+      &state,
+      text.clone(),
+      history,
+    )
+    .await
+    {
+      error!("Error regenerating with guidance: {}", e);
+
+      // Send error message to user
+      bot_client
+        .send_message_with_buttons(
+          message.chat.id,
+          format!("❌ Failed to regenerate: {}", e),
+          vec![],
+        )
+        .await?;
+    }
+  }
+
+  Ok(())
+}
+
+async fn regenerate_with_guidance(
+  _client: &Client,
+  peer: PeerRef,
+  user: &TrackedUser,
+  state: &Arc<Mutex<BotState>>,
+  guidance: String,
+  history: Vec<ChatMessage>,
+) -> Result<()> {
+  let (api_key, api_url, models, temperature, bot_client, bot_self_id) = {
+    let lock = state.lock().unwrap();
+    (
+      lock.config.ai.api_key.clone(),
+      lock.config.ai.api_url.clone(),
+      lock.config.ai.models.clone(),
+      lock.config.ai.temperature,
+      lock.bot_client.clone(),
+      lock.bot_self_id,
+    )
+  };
+
+  // Build the system prompt with rephrase guidance
+  let system_prompt =
+    format!("{}\n\nAdditional guidance: {}", user.system_prompt, guidance);
+
+  debug!("Regenerating AI response with guidance");
+
+  let response_text = llm::generate_reply_with_fallback(
+    &api_key,
+    &api_url,
+    models,
+    temperature,
+    &system_prompt,
+    history.clone(),
+  )
+  .await
+  .context("Failed to generate AI reply with guidance")?;
+
+  info!("Regenerated AI response with guidance for user {}", user.name);
+
+  // Send new draft via Bot API with inline buttons
+  let target_id = peer.id.bare_id();
+  let draft_message = format!(
+    "*AI Draft Suggestion for @{}*\n_(Rephrased)_\n\n{}\n\n",
+    user.name, response_text
+  );
+
+  let callback_data = format!("approve:{}", target_id);
+  let rephrase_data = format!("rephrase:{}", target_id);
+  let reject_data = format!("reject:{}", target_id);
+
+  let buttons = vec![vec![
+    ("✅ Approve".to_string(), callback_data.clone()),
+    ("🔄 Rephrase".to_string(), rephrase_data.clone()),
+    ("❌ Reject".to_string(), reject_data.clone()),
+  ]];
+
+  let message_id = bot_client
+    .send_message_with_buttons(bot_self_id, draft_message, buttons)
+    .await
+    .context("Failed to send rephrased draft via bot")?;
+
+  // Store draft message and history for later retrieval
+  {
+    let mut lock = state.lock().unwrap();
+    lock.draft_messages.insert(callback_data, (target_id, response_text));
+    lock.pending_rephrase.insert(target_id, (bot_self_id, message_id, history));
+  }
+
+  debug!("Sent rephrased draft message via bot to self");
 
   Ok(())
 }
