@@ -55,8 +55,12 @@ pub struct TrackedUser {
 }
 
 impl TrackedUser {
-  pub fn peer_id(&self) -> PeerId {
+  pub fn user_id(&self) -> PeerId {
     PeerId::user(self.id)
+  }
+
+  pub fn chat_id(&self) -> PeerId {
+    PeerId::chat(self.id)
   }
 }
 
@@ -95,6 +99,6 @@ impl Config {
   }
 
   pub fn users_map(&self) -> HashMap<PeerId, TrackedUser> {
-    self.users.iter().map(|user| (user.peer_id(), user.clone())).collect()
+    self.users.iter().map(|user| (user.chat_id(), user.clone())).collect()
   }
 }

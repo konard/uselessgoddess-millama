@@ -14,6 +14,6 @@ mod tests {
       system_prompt: "Be helpful".to_string(),
     };
 
-    assert_eq!(user.peer_id(), PeerId::user(12345));
+    assert_eq!(user.user_id(), PeerId::user(12345));
   }
 }

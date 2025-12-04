@@ -222,6 +222,7 @@ async fn handle_update(
       Err(peer) => peer,
     };
 
+    // TODO: escape any control characters  
     trace!("Message from user ({}): {}", peer.id, message.text());
 
     // Handle messages from tracked users
@@ -280,25 +281,6 @@ async fn handle_update(
 
       return Ok(());
     }
-
-    // Handle approval messages
-    if peer.id == self_id {
-      let text = message.text().trim();
-      debug!("Message to self: {}", text);
-
-      // Check for approval keywords
-      if ["+", "y", "yes", "ok", "да", "approve"]
-        .contains(&text.to_lowercase().as_str())
-        && let Some(reply_to) = message.get_reply().await?
-      {
-        let reply_text = reply_to.text();
-
-        if reply_text.contains("--- METADATA ---") {
-          debug!("Found metadata in reply, processing approval");
-          handle_approval(&client, &message, reply_text).await?;
-        }
-      }
-    }
   }
   Ok(())
 }
@@ -334,6 +316,10 @@ async fn process_ai_draft(
   let mut history_buf: Vec<ChatMessage> = Vec::new();
 
   debug!("Fetching message history for peer {}", peer.id);
+
+  // TODO: improve this api, avoid this manual cast
+  //  you can resolve peer only for user, not chat id 
+  let peer = PeerRef { id: PeerId::user(peer.id.bare_id()), auth: Default::default() };
   let chat_peer = client
     .resolve_peer(peer)
     .await
@@ -404,68 +390,6 @@ async fn process_ai_draft(
   Ok(())
 }
 
-async fn handle_approval(
-  client: &Client,
-  my_approve_msg: &grammers_client::types::Message,
-  draft_text: &str,
-) -> Result<()> {
-  // Parse metadata from draft text
-  let target_id = draft_text
-    .lines()
-    .find(|line| line.starts_with("TARGET_ID:"))
-    .and_then(|line| line.strip_prefix("TARGET_ID:"))
-    .and_then(|s| s.parse::<i64>().ok())
-    .context("Failed to parse TARGET_ID")?;
-
-  info!("Approving message to target ID: {}", target_id);
-
-  let target =
-    PeerRef { id: PeerId::chat(target_id), auth: Default::default() };
-
-  // Extract the actual message content
-  let content_part = draft_text.split("--- METADATA ---").next().unwrap_or("");
-  let lines: Vec<&str> = content_part.lines().collect();
-
-  // Skip header and instructions
-  let clean_text = lines
-    .iter()
-    .skip_while(|line| {
-      line.trim().is_empty() || line.contains("AI Draft") || line.contains("**")
-    })
-    .take_while(|line| !line.contains("Reply with") && !line.starts_with('`'))
-    .copied()
-    .collect::<Vec<&str>>()
-    .join("\n");
-
-  let final_text = clean_text.trim();
-
-  if final_text.is_empty() {
-    warn!("Final text is empty, aborting approval");
-    return Ok(());
-  }
-
-  debug!("Sending approved message: {}", final_text);
-
-  let target_peer = client.resolve_peer(target).await?;
-  client
-    .send_message(target_peer, final_text)
-    .await
-    .context("Failed to send approved message")?;
-
-  if let Some(reply_to) = my_approve_msg.get_reply().await? {
-    reply_to
-      .edit(format!("✅ **Sent.**\n\n{}", final_text))
-      .await
-      .context("Failed to edit reply")?;
-  }
-
-  my_approve_msg.delete().await.context("Failed to delete approval message")?;
-
-  info!("Message sent successfully to {}", target_id);
-
-  Ok(())
-}
-
 async fn poll_bot_updates(
   bot_client: Arc<bot::BotClient>,
   client: Client,
@@ -522,10 +446,10 @@ async fn handle_bot_callback(
 
     info!("Approving message to target ID: {}", target_id);
 
-    debug!("Sending approved message: {}", message_text);
-
     let target =
-      PeerRef { id: PeerId::chat(target_id), auth: Default::default() };
+      PeerRef { id: PeerId::user(target_id), auth: Default::default() };
+
+    debug!("Sending approved message to ({}): {}", target.id, message_text);
 
     let target_peer = client.resolve_peer(target).await?;
     client
@@ -538,7 +462,7 @@ async fn handle_bot_callback(
       .edit_message_text(
         message.chat.id,
         message.message_id,
-        format!("✅ *Sent*\n\n{}", message_text),
+        message_text,
       )
       .await
       .context("Failed to edit message")?;
