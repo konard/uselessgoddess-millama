@@ -1,3 +1,4 @@
+mod bot;
 mod config;
 mod llm;
 
@@ -26,13 +27,15 @@ use {
   config::{Config, TrackedUser},
   llm::ChatMessage,
   tokio::{task::JoinSet, time::sleep},
-  tracing::{trace, debug, error, info, warn},
+  tracing::{debug, error, info, trace, warn},
 };
 
 struct BotState {
   pending_tasks: HashMap<PeerId, tokio::task::AbortHandle>,
   users: HashMap<PeerId, TrackedUser>,
   config: Config,
+  bot_client: Option<Arc<bot::BotClient>>,
+  bot_self_id: Option<i64>,
 }
 
 #[derive(Parser, Debug)]
@@ -89,10 +92,17 @@ async fn main() -> Result<()> {
 async fn run_client(config: Config) -> Result<()> {
   let users_map = config.users_map();
 
+  let bot_client = config.telegram.bot_token.as_ref().map(|token| {
+    info!("Bot token configured, will use Bot API for approval workflow");
+    Arc::new(bot::BotClient::new(token.clone()))
+  });
+
   let state = Arc::new(Mutex::new(BotState {
     pending_tasks: HashMap::new(),
     users: users_map,
     config: config.clone(),
+    bot_client,
+    bot_self_id: None,
   }));
 
   info!("Connecting to Telegram...");
@@ -129,12 +139,41 @@ async fn run_client(config: Config) -> Result<()> {
   }
   info!("Signed in successfully!");
 
+  // Get self user ID
+  let me = client.get_me().await?;
+  let self_id_bare = me.raw.id();
+
+  // Store self ID for bot messages
+  {
+    let mut lock = state.lock().unwrap();
+    lock.bot_self_id = Some(self_id_bare);
+  }
+
   let self_id = PeerId::self_user();
-  info!("Running as self user");
+  info!("Running as self user (ID: {})", self_id_bare);
 
   let mut update_stream =
     client.stream_updates(updates, UpdatesConfiguration::default());
   let mut tasks = JoinSet::new();
+
+  // Start bot updates polling task if bot_client is configured
+  let bot_client_for_polling = {
+    let lock = state.lock().unwrap();
+    lock.bot_client.clone()
+  };
+
+  if let Some(bot_client) = bot_client_for_polling {
+    let state_for_bot = state.clone();
+    let client_for_bot = client.clone();
+    tasks.spawn(async move {
+      if let Err(e) =
+        poll_bot_updates(bot_client, client_for_bot, state_for_bot).await
+      {
+        error!("Bot updates polling error: {}", e);
+      }
+    });
+    info!("Started bot updates polling task");
+  }
 
   info!("Bot is ready and listening for updates");
 
@@ -156,7 +195,13 @@ async fn run_client(config: Config) -> Result<()> {
             let client = client.clone();
             let state = state.clone();
 
-            tasks.spawn(handle_update(client, update, state, self_id));
+            tasks.spawn(async move {
+              if let Err(e) =
+                handle_update(client, update, state, self_id).await
+              {
+                error!("Error handling update: {}", e);
+              }
+            });
         }
     }
   }
@@ -179,11 +224,7 @@ async fn handle_update(
       Err(peer) => peer,
     };
 
-    trace!(
-        "Message from user ({}): {}",
-        peer.id,
-        message.text()
-      );
+    trace!("Message from user ({}): {}", peer.id, message.text());
 
     // Handle messages from tracked users
     let tracked_user = {
@@ -270,7 +311,15 @@ async fn process_ai_draft(
   user: &TrackedUser,
   state: &Arc<Mutex<BotState>>,
 ) -> Result<()> {
-  let (api_key, api_url, model, temperature, history_limit) = {
+  let (
+    api_key,
+    api_url,
+    model,
+    temperature,
+    history_limit,
+    bot_client,
+    bot_self_id,
+  ) = {
     let lock = state.lock().unwrap();
     (
       lock.config.ai.api_key.clone(),
@@ -278,6 +327,8 @@ async fn process_ai_draft(
       lock.config.ai.model.clone(),
       lock.config.ai.temperature,
       lock.config.settings.history_limit,
+      lock.bot_client.clone(),
+      lock.bot_self_id,
     )
   };
 
@@ -326,33 +377,58 @@ async fn process_ai_draft(
 
   info!("Generated AI response for user {}", user.name);
 
-  let draft_message = format!(
-    concat!(
-      "**AI Draft Suggestion for {}**\n\n{}\n\n`{}`\n\n",
-      "Reply with '+', 'yes', or 'approve' to send\n\n",
-      "--- METADATA ---\nTARGET_ID:{}\n"
-    ),
-    user.name,
-    response_text,
-    "-".repeat(20),
-    peer.id.bare_id()
-  );
+  // Use bot API if configured, otherwise fall back to self-messages
+  if let (Some(bot_client), Some(self_id)) = (bot_client, bot_self_id) {
+    // Use Bot API with inline buttons
+    let draft_message = format!(
+      "*AI Draft Suggestion for {}*\n\n{}\n\n",
+      user.name, response_text
+    );
 
-  // Send draft to self
-  client
-    .send_message(
-      PeerRef { id: PeerId::self_user(), auth: Default::default() },
-      InputMessage::new().text(draft_message).fmt_entities([
-        MessageEntity::Bold(MessageEntityBold {
-          offset: 0,
-          length: (32 + user.name.len()) as i32,
-        }),
-      ]),
-    )
-    .await
-    .context("Failed to send draft message")?;
+    let callback_data = format!("approve:{}", peer.id.bare_id());
+    let reject_data = format!("reject:{}", peer.id.bare_id());
 
-  debug!("Sent draft message to self");
+    let buttons = vec![vec![
+      ("✅ Approve".to_string(), callback_data),
+      ("❌ Reject".to_string(), reject_data),
+    ]];
+
+    bot_client
+      .send_message_with_buttons(self_id, draft_message, buttons)
+      .await
+      .context("Failed to send draft via bot")?;
+
+    debug!("Sent draft message via bot to self");
+  } else {
+    // Fall back to self-messages
+    let draft_message = format!(
+      concat!(
+        "**AI Draft Suggestion for {}**\n\n{}\n\n`{}`\n\n",
+        "Reply with '+', 'yes', or 'approve' to send\n\n",
+        "--- METADATA ---\nTARGET_ID:{}\n"
+      ),
+      user.name,
+      response_text,
+      "-".repeat(20),
+      peer.id.bare_id()
+    );
+
+    // Send draft to self
+    client
+      .send_message(
+        PeerRef { id: PeerId::self_user(), auth: Default::default() },
+        InputMessage::new().text(draft_message).fmt_entities([
+          MessageEntity::Bold(MessageEntityBold {
+            offset: 0,
+            length: (32 + user.name.len()) as i32,
+          }),
+        ]),
+      )
+      .await
+      .context("Failed to send draft message")?;
+
+    debug!("Sent draft message to self");
+  }
 
   Ok(())
 }
@@ -415,6 +491,130 @@ async fn handle_approval(
   my_approve_msg.delete().await.context("Failed to delete approval message")?;
 
   info!("Message sent successfully to {}", target_id);
+
+  Ok(())
+}
+
+async fn poll_bot_updates(
+  bot_client: Arc<bot::BotClient>,
+  client: Client,
+  _state: Arc<Mutex<BotState>>,
+) -> Result<()> {
+  let mut offset: Option<i64> = None;
+
+  loop {
+    let updates = bot_client.get_updates(offset).await?;
+
+    for update in updates {
+      offset = Some(update.update_id + 1);
+
+      if let Some(callback) = update.callback_query {
+        let bot_client = bot_client.clone();
+        let client = client.clone();
+
+        tokio::spawn(async move {
+          if let Err(e) =
+            handle_bot_callback(bot_client, client, callback).await
+          {
+            error!("Error handling bot callback: {}", e);
+          }
+        });
+      }
+    }
+  }
+}
+
+async fn handle_bot_callback(
+  bot_client: Arc<bot::BotClient>,
+  client: Client,
+  callback: bot::CallbackQuery,
+) -> Result<()> {
+  let data = callback.data.as_ref().context("No callback data")?;
+  let message = callback.message.as_ref().context("No callback message")?;
+
+  debug!("Received callback: {}", data);
+
+  // Answer the callback query to remove the loading state
+  bot_client
+    .answer_callback_query(&callback.id, None)
+    .await
+    .context("Failed to answer callback query")?;
+
+  if data.starts_with("approve:") {
+    let target_id = data
+      .strip_prefix("approve:")
+      .and_then(|s| s.parse::<i64>().ok())
+      .context("Failed to parse target ID from callback")?;
+
+    info!("Approving message to target ID: {}", target_id);
+
+    // Extract the message text from the bot message
+    let message_text = message.text.as_ref().context("No message text")?;
+
+    // Extract just the AI response (skip the header)
+    let lines: Vec<&str> = message_text.lines().collect();
+    let clean_text = lines
+      .iter()
+      .skip_while(|line| {
+        line.trim().is_empty()
+          || line.contains("AI Draft")
+          || line.contains("Suggestion")
+      })
+      .skip(1) // Skip the blank line after header
+      .copied()
+      .collect::<Vec<&str>>()
+      .join("\n");
+
+    let final_text = clean_text.trim();
+
+    if final_text.is_empty() {
+      warn!("Final text is empty, aborting approval");
+      bot_client
+        .edit_message_text(
+          message.chat.id,
+          message.message_id,
+          "❌ *Error:* Empty message, approval cancelled".to_string(),
+        )
+        .await
+        .context("Failed to edit message")?;
+      return Ok(());
+    }
+
+    debug!("Sending approved message: {}", final_text);
+
+    let target =
+      PeerRef { id: PeerId::chat(target_id), auth: Default::default() };
+
+    let target_peer = client.resolve_peer(target).await?;
+    client
+      .send_message(target_peer, final_text)
+      .await
+      .context("Failed to send approved message")?;
+
+    // Update the bot message to show it was sent
+    bot_client
+      .edit_message_text(
+        message.chat.id,
+        message.message_id,
+        format!("✅ *Sent*\n\n{}", final_text),
+      )
+      .await
+      .context("Failed to edit message")?;
+
+    info!("Message sent successfully to {}", target_id);
+  } else if data.starts_with("reject:") {
+    info!("Rejecting draft");
+
+    // Update the bot message to show it was rejected
+    bot_client
+      .edit_message_text(
+        message.chat.id,
+        message.message_id,
+        "❌ *Rejected*".to_string(),
+      )
+      .await
+      .context("Failed to edit message")?;
+  }
 
   Ok(())
 }
